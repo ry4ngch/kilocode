@@ -7,6 +7,7 @@ import * as vscode from "vscode"
 import { resolveLocalBwrapEnv, resolveTreeSitterEnv } from "./cli-resources"
 import { t } from "./i18n"
 import { ensureServerCwd, scanServerPort } from "./server-utils"
+import { ensureTermuxCli, isTermux } from "./termux"
 
 export interface ServerInstance {
   port: number
@@ -252,6 +253,10 @@ export class ServerManager {
     const binName = process.platform === "win32" ? "kilo.exe" : "kilo"
     const cliPath = path.join(this.context.extensionPath, "bin", binName)
     console.log("[Kilo New] ServerManager: 📦 Using CLI path:", cliPath)
+    // On Android (Termux) the bundled glibc binary is bridged through the
+    // Termux glibc runtime: bin/kilo becomes a loader wrapper, bin/kilo.bin
+    // holds the untouched ELF.
+    if (isTermux()) return ensureTermuxCli(cliPath)
     return cliPath
   }
 
