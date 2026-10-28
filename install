@@ -20,6 +20,10 @@ Options:
     -b, --binary <path>     Install from a local binary instead of downloading
         --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
 
+Notes:
+    On Android (Termux) the Linux binary runs through Termux's native glibc
+    runtime via its dynamic loader — no proot, no patched ELF.
+
 Examples:
     curl -fsSL https://kilo.ai/cli/install | bash
     curl -fsSL https://kilo.ai/cli/install | bash -s -- --version 1.0.180
@@ -69,6 +73,18 @@ done
 
 INSTALL_DIR=$HOME/.kilo/bin # kilocode_change
 mkdir -p "$INSTALL_DIR"
+
+# kilocode_change start - termux/android bionic detection (borrowed from
+# opencode-native-termux): always use the glibc build, bridged through
+# Termux's native glibc package at runtime. Detected before the --binary
+# branch so both install paths get the bridge.
+is_termux=false
+termux_prefix=""
+if { [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]; }; then
+  termux_prefix="${PREFIX:-/data/data/com.termux/files/usr}"
+  is_termux=true
+fi
+# kilocode_change end
 
 # If --binary is provided, skip all download/detection logic
 if [ -n "$binary_path" ]; then
@@ -128,6 +144,14 @@ else
         fi
       fi
     fi
+
+    # kilocode_change start - on Termux never pick the musl build; the glibc
+    # build is bridged through Termux's glibc package (see install_termux_bridge)
+    if [ "$is_termux" = true ]; then
+      is_musl=false
+    fi
+    # kilocode_change end
+
 
     needs_baseline=false
     if [ "$arch" = "x64" ]; then
@@ -332,6 +356,54 @@ download_with_progress() {
     return $ret
 }
 
+# kilocode_change start - termux/android bionic bridge, adapted from
+# opencode-native-termux: the kilo binary is glibc-linked; Termux (bionic)
+# has no /lib and no /lib/ld-linux-aarch64.so.1, but ships a real glibc via
+# the `glibc` package under $PREFIX/glibc/. We exec the unmodified binary
+# through that loader with --library-path, and force-load nothing bionic
+# (LD_PRELOAD holds libtermux-exec, a bionic library that crashes the glibc
+# loader with "invalid ELF header"). The loader is exec'd via a symlink
+# named "kilo" so the kernel process name (comm) stays "kilo" for tools
+# that identify agents by process name. Never run patchelf/glibc-runner on
+# the binary — rewriting the ELF interpreter segfaults bun-compiled
+# binaries on Android.
+ensure_termux_glibc() {
+    local arch loader
+    arch=$(uname -m 2>/dev/null || echo aarch64)
+    case "$arch" in
+      x86_64) loader="$termux_prefix/glibc/lib/ld-linux-x86-64.so.2" ;;
+      *)      loader="$termux_prefix/glibc/lib/ld-linux-aarch64.so.1" ;;
+    esac
+    if ! [ -f "$loader" ]; then
+        print_message info "${MUTED}Installing Termux glibc runtime (one-time)...${NC}"
+        pkg install -y glibc-repo >/dev/null 2>&1 || true
+        if ! pkg install -y glibc && ! [ -f "$loader" ]; then
+            echo -e "${RED}Error: failed to install glibc. Run 'pkg install -y glibc' manually, then retry.${NC}"
+            exit 1
+        fi
+    fi
+}
+
+install_termux_bridge() {
+    ensure_termux_glibc
+    local arch loader
+    arch=$(uname -m 2>/dev/null || echo aarch64)
+    case "$arch" in
+      x86_64) loader="$termux_prefix/glibc/lib/ld-linux-x86-64.so.2" ;;
+      *)      loader="$termux_prefix/glibc/lib/ld-linux-aarch64.so.1" ;;
+    esac
+    mkdir -p "$INSTALL_DIR/kilo-runtime"
+    ln -sf "$loader" "$INSTALL_DIR/kilo-runtime/kilo"
+    cat > "$INSTALL_DIR/kilo" <<WRAPPER
+#!/bin/sh
+exec env -u LD_PRELOAD "$INSTALL_DIR/kilo-runtime/kilo" \\
+  --library-path "$termux_prefix/glibc/lib" \\
+  "$INSTALL_DIR/kilo.bin" "\$@"
+WRAPPER
+    chmod 755 "${INSTALL_DIR}/kilo" "${INSTALL_DIR}/kilo.bin" "${INSTALL_DIR}/kilo-runtime/kilo"
+}
+# kilocode_change end
+
 download_and_install() {
     # kilocode_change start
     print_message info "\n${MUTED}Installing ${NC}Kilo Code ${MUTED}version: ${NC}$specific_version"
@@ -351,12 +423,17 @@ download_and_install() {
     fi
 
     # kilocode_change start
-    mv "$tmp_dir/kilo" "$INSTALL_DIR"
     rm -rf "${INSTALL_DIR}/tree-sitter"
     if [ -d "$tmp_dir/tree-sitter" ]; then
         mv "$tmp_dir/tree-sitter" "$INSTALL_DIR"
     fi
-    chmod 755 "${INSTALL_DIR}/kilo"
+    if [ "$is_termux" = true ]; then
+        mv "$tmp_dir/kilo" "$INSTALL_DIR/kilo.bin"
+        install_termux_bridge
+    else
+        mv "$tmp_dir/kilo" "$INSTALL_DIR"
+        chmod 755 "${INSTALL_DIR}/kilo"
+    fi
     # kilocode_change end
     rm -rf "$tmp_dir"
 }
@@ -364,8 +441,14 @@ download_and_install() {
 install_from_binary() {
     # kilocode_change start
     print_message info "\n${MUTED}Installing ${NC}Kilo Code ${MUTED}from: ${NC}$binary_path"
-    cp "$binary_path" "${INSTALL_DIR}/kilo"
-    chmod 755 "${INSTALL_DIR}/kilo"
+    cp "$binary_path" "${INSTALL_DIR}/kilo.bin"
+    chmod 755 "${INSTALL_DIR}/kilo.bin"
+    if [ "$is_termux" = true ]; then
+        install_termux_bridge
+    else
+        cp "$INSTALL_DIR/kilo.bin" "${INSTALL_DIR}/kilo"
+        chmod 755 "${INSTALL_DIR}/kilo"
+    fi
     # kilocode_change end
 }
 
